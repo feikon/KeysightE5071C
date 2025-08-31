@@ -373,9 +373,6 @@ def format_num(arg: Optional[Union[int, float, str, SupportsFloat]],
     """
     if arg == None or arg == '?':
         return '?'
-    else:
-    if arg == None or arg == '?':
-        return '?'
 
     try:
         # 转换为浮点数并应用单位转换
@@ -464,17 +461,19 @@ class E5071C:
             self._inst = visa.ResourceManager().open_resource(address)
         else:
             self._inst = visa.ResourceManager(visa_backend).open_resource(address)
+        # 类型注解，用于解决静态类型检查问题
+        self._inst: Any = self._inst
         self.verbatim = verbatim
         identity = self.identify()
         print("Identity: {}".format(identity))
-        if "E5071C" not in identity:
+        identity_str = str(identity)  # 确保类型为字符串
+        if "E5071C" not in identity_str:
             import warnings
             warnings.warn(
                 f"警告: 设备 {address} 不是 E5071C 矢量网络分析仪。\n某些命令可能无法工作。",
                 UserWarning
             )
 
-        self.verbatim = verbatim  # Print every command before sending
         self._is_connected = True
         self._parameter_cache = {}  # 参数缓存
         self._cache_timeout = 2.0   # 缓存超时时间(秒)
@@ -551,7 +550,7 @@ class E5071C:
     ########################################
     # Selecting channel and trace
     ########################################
-    def traces_number(self, num: Optional[int] = None, chan: str = "") -> Union[int, str]:
+    def traces_number(self, num: Optional[int] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询迹近数量
 
@@ -567,12 +566,12 @@ class E5071C:
             >>> vna.traces_number()   # 查询当前迹近数量
         """
         if num != None:
-            num = " " + str(num)
+            num_str = " " + str(num)
         elif num == None:
-            num = "?"
-        return self._com(":CALC{}:PAR:COUN{}".format(chan, num))
+            num_str = "?"
+        return self._com(":CALC{}:PAR:COUN{}".format(chan, num_str))
 
-    def displayed_channels(self, chans: str = '?') -> str:
+    def displayed_channels(self, chans: str = '?') -> Union[float, str]:
         """
         设置或查询显示的通道
 
@@ -589,7 +588,7 @@ class E5071C:
         chans = format_from_dict(chans, VNAConstants.DISPLAY_CHANNELS)
         return self._com(":DISP:SPL{}".format(chans))
 
-    def active_chan(self, chan: Optional[int] = None) -> Union[int, str]:
+    def active_chan(self, chan: Optional[int] = None) -> Union[float, str]:
         """
         设置或查询活动通道
 
@@ -603,13 +602,13 @@ class E5071C:
             >>> vna.active_chan(1)  # 设置通道1为活动通道
             >>> vna.active_chan()   # 查询当前活动通道
         """
-        chan = format_num(chan)
-        if chan == '?':
+        chan_str = format_num(chan)
+        if chan_str == '?':
             return self._com(':SERV:CHAN:ACT?')
         else:
-            return self._com(":DISP:WIND{}:ACT".format(chan))
+            return self._com(":DISP:WIND{}:ACT".format(chan_str))
 
-    def active_trace(self, trace: Optional[int] = None, chan: str = "") -> Union[int, str]:
+    def active_trace(self, trace: Optional[int] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询活动迹近
 
@@ -624,17 +623,17 @@ class E5071C:
             >>> vna.active_trace(1)  # 设置迹近1为活动迹近
             >>> vna.active_trace()   # 查询当前活动迹近
         """
-        trace = format_num(trace)
-        if trace == '?':
+        trace_str = format_num(trace)
+        if trace_str == '?':
             return self._com(":SERV:CHAN{}:TRAC:ACT?".format(chan))
         else:
-            return self._com(':CALC{}:PAR{}:SEL'.format(chan, trace))
+            return self._com(':CALC{}:PAR{}:SEL'.format(chan, trace_str))
 
     ########################################
     # Averaging
     ########################################
 
-    def average_reset(self, chan: str = "") -> str:
+    def average_reset(self, chan: str = "") -> Union[float, str]:
         """
         重置平均统计
 
@@ -649,7 +648,7 @@ class E5071C:
         """
         return self._com(":SENS{}:AVER:CLE".format(chan))
 
-    def average_count(self, count: Optional[int] = None, chan: str = "") -> Union[int, str]:
+    def average_count(self, count: Optional[int] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询平均次数
 
@@ -664,10 +663,10 @@ class E5071C:
             >>> vna.average_count(10)  # 设置平均次数为10
             >>> vna.average_count()    # 查询当前平均次数
         """
-        count = format_num(count)
-        return self._com(":SENS{}:AVER:COUN{}".format(chan, count))
+        count_str = format_num(count)
+        return self._com(":SENS{}:AVER:COUN{}".format(chan, count_str))
 
-    def average_state(self, state: Optional[Union[str, bool, int]] = None, chan: str = "") -> Union[bool, str]:
+    def average_state(self, state: Optional[Union[str, bool, int]] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询平均状态
 
@@ -706,8 +705,8 @@ class E5071C:
             >>> vna.freq_start(1e9)    # 设置起始频率为1GHz
             >>> vna.freq_start()       # 查询当前起始频率
         """
-        freq = format_num(freq, 1)
-        return self._com(":SENS{}:FREQ:STAR{}".format(chan, freq))
+        freq_str = format_num(freq, 1)
+        return self._com(":SENS{}:FREQ:STAR{}".format(chan, freq_str))
 
     @validate_parameter('freq', param_range=(10e3, 20e9))
     def freq_stop(self, freq: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
@@ -725,8 +724,8 @@ class E5071C:
             >>> vna.freq_stop(2e9)     # 设置终止频率为2GHz
             >>> vna.freq_stop()        # 查询当前终止频率
         """
-        freq = format_num(freq, 1)
-        return self._com(":SENS{}:FREQ:STOP{}".format(chan, freq))
+        freq_str = format_num(freq, 1)
+        return self._com(":SENS{}:FREQ:STOP{}".format(chan, freq_str))
 
     def freq_center(self, freq: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
         """
@@ -743,8 +742,8 @@ class E5071C:
             >>> vna.freq_center(1.5e9)  # 设置中心频率为1.5GHz
             >>> vna.freq_center()       # 查询当前中心频率
         """
-        freq = format_num(freq, 1)
-        return self._com(":SENS{}:FREQ:CENT{}".format(chan, freq))
+        freq_str = format_num(freq, 1)
+        return self._com(":SENS{}:FREQ:CENT{}".format(chan, freq_str))
 
     def freq_span(self, freq: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
         """
@@ -761,11 +760,11 @@ class E5071C:
             >>> vna.freq_span(1e9)     # 设置频率范围为1GHz
             >>> vna.freq_span()        # 查询当前频率范围
         """
-        freq = format_num(freq, 1)
-        return self._com(":SENS{}:FREQ:SPAN{}".format(chan, freq))
+        freq_str = format_num(freq, 1)
+        return self._com(":SENS{}:FREQ:SPAN{}".format(chan, freq_str))
 
     @validate_parameter('points', param_range=(2, 20001), param_type=int)
-    def points(self, points: Optional[int] = None, chan: str = "") -> Union[int, str]:
+    def points(self, points: Optional[int] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询测量点数
 
@@ -780,8 +779,8 @@ class E5071C:
             >>> vna.points(1001)       # 设置测量点数为1001
             >>> vna.points()           # 查询当前点数
         """
-        points = format_num(points)
-        return self._com(":SENS{}:SWE:POIN{}".format(chan, points))
+        points_str = format_num(points)
+        return self._com(":SENS{}:SWE:POIN{}".format(chan, points_str))
 
     def ifbw(self, bandwidth: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
         """
@@ -798,8 +797,8 @@ class E5071C:
             >>> vna.ifbw(1000)         # 设置中频带宽为1kHz
             >>> vna.ifbw()             # 查询当前带宽
         """
-        bandwidth = format_num(bandwidth)
-        return self._com(":SENS{}:BAND:RES{}".format(chan, bandwidth))
+        bandwidth_str = format_num(bandwidth)
+        return self._com(":SENS{}:BAND:RES{}".format(chan, bandwidth_str))
 
     def bandwidth(self, bandwidth: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
         """
@@ -860,8 +859,8 @@ class E5071C:
             >>> vna.delay(1e-9)        # 设置延迟为1ns
             >>> vna.delay()            # 查询当前延迟
         """
-        delay = format_num(delay)
-        return self._com(":CALC{}:CORR:EDEL:TIME{}".format(chan, delay))
+        delay_str = format_num(delay)
+        return self._com(":CALC{}:CORR:EDEL:TIME{}".format(chan, delay_str))
 
     def phase_offset(self, phase=None, chan=""):
         """
@@ -878,8 +877,8 @@ class E5071C:
             >>> vna.phase_offset(90)   # 设置相位偏移为90度
             >>> vna.phase_offset()     # 查询当前相位偏移
         """
-        phase = format_num(phase)
-        return self._com(":CALC{}:CORR:OFFS:PHAS{}".format(chan, phase))
+        phase_str = format_num(phase)
+        return self._com(":CALC{}:CORR:OFFS:PHAS{}".format(chan, phase_str))
 
     @validate_parameter('power', param_range=(-85, 30))  # 典型VNA功率范围
     def power(self, power: Optional[Union[int, float]] = None, source: str = '') -> Union[float, str]:
@@ -897,8 +896,8 @@ class E5071C:
             >>> vna.power(-10)         # 设置输出功率为-10dBm
             >>> vna.power()            # 查询当前功率
         """
-        power = format_num(power)
-        return self._com(':SOUR{}:POW{}'.format(source, power))
+        power_str = format_num(power)
+        return self._com(':SOUR{}:POW{}'.format(source, power_str))
 
     def output(self, out=None):
         """
@@ -1080,7 +1079,7 @@ class E5071C:
         self.format_data('real')
         data = self._com_binary(':CALC:SEL:DATA:XAXis?')
         self.format_data('ascii')
-        return data
+        return data  # type: ignore
 
     def read_trace(self, trace: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -1099,13 +1098,15 @@ class E5071C:
             >>> magnitude = np.sqrt(real_part**2 + imag_part**2)
             >>> phase = np.arctan2(imag_part, real_part) * 180 / np.pi
         """
-        if trace==None:
-            trace = '?'
+        if trace == None:
+            trace_str = '?'
+        else:
+            trace_str = str(trace)
         self.format_data('real')
-        data = self._com_binary(':CALC:TRACe{}:DATA:FDATa?'.format(trace))
+        data = self._com_binary(':CALC:TRACe{}:DATA:FDATa?'.format(trace_str))
         self.format_data('ascii')
 
-        return data[0::2], data[1::2]
+        return data[0::2], data[1::2]  # type: ignore
 
     def read_all_traces(self) -> np.ndarray:
         """
@@ -1218,12 +1219,12 @@ class E5071C:
                 warnings.warn(f"关闭VISA连接时发生错误: {e}", UserWarning)
                 raise
 
-    def identify(self) -> str:
+    def identify(self) -> Union[float, str]:
         """
         查询仪器身份信息
 
         返回:
-            str: 仪器身份字符串，包括制造商、型号、序列号等
+            仪器身份字符串，包括制造商、型号、序列号等
 
         使用实例:
             >>> identity = vna.identify()
@@ -1231,48 +1232,48 @@ class E5071C:
         """
         return self._com("*IDN?")
 
-    def idn(self) -> str:
+    def idn(self) -> Union[float, str]:
         """
         查询仪器身份信息（identify的别名）
 
         返回:
-            str: 仪器身份字符串
+            仪器身份字符串
 
         使用实例:
             >>> identity = vna.idn()
         """
         return self._com("*IDN?")
 
-    def reset(self) -> str:
+    def reset(self) -> Union[float, str]:
         """
         重置仪器到默认状态
 
         返回:
-            str: 命令确认
+            命令确认
 
         使用实例:
             >>> vna.reset()  # 重置仪器
         """
         return self._com('*RST')
 
-    def rst(self) -> str:
+    def rst(self) -> Union[float, str]:
         """
         重置仪器到默认状态（reset的别名）
 
         返回:
-            str: 命令确认
+            命令确认
 
         使用实例:
             >>> vna.rst()  # 重置仪器
         """
         return self._com('*RST')
 
-    def operation_complete(self) -> Union[int, str]:
+    def operation_complete(self) -> Union[float, str]:
         """
         查询操作是否完成
 
         返回:
-            int: 1表示操作完成，0表示还在执行
+            1表示操作完成，0表示还在执行
 
         使用实例:
             >>> while not vna.operation_complete():
@@ -1280,24 +1281,24 @@ class E5071C:
         """
         return self._com("*OPC?")
 
-    def opc(self) -> Union[int, str]:
+    def opc(self) -> Union[float, str]:
         """
         查询操作是否完成（operation_complete的别名）
 
         返回:
-            int: 1表示操作完成
+            1表示操作完成
 
         使用实例:
             >>> vna.opc()
         """
         return self.operation_complete()
 
-    def get_sweep_time(self) -> str:
+    def get_sweep_time(self) -> Union[float, str]:
         """
         查询扫描时间
 
         返回:
-            str: 扫描时间（秒）
+            扫描时间（秒）
 
         使用实例:
             >>> sweep_time = float(vna.get_sweep_time())
@@ -1370,9 +1371,9 @@ class E5071C:
         if type(stop) != str:
             self.freq_stop(stop)
         if type(center) != str:
-            self.freq_center(center)
+            self.freq_center(float(center) if center is not None else None)
         if type(span) != str:
-            self.freq_span(span)
+            self.freq_span(float(span) if span is not None else None)
 
         self.points(point)
         self.bandwidth(bandwidth)
@@ -1527,7 +1528,7 @@ class E5071C:
     # send commands
     ##############################
 
-    def _com(self, cmd):
+    def _com(self, cmd: str) -> Union[float, str]:
         """
         内部通信方法，用于发送SCPI命令
 
@@ -1555,7 +1556,7 @@ class E5071C:
             self._inst.write(cmd)
             return "Sent: " + cmd
 
-    def _com_binary(self, cmd):
+    def _com_binary(self, cmd: str) -> Union[np.ndarray, str]:
         """
         内部二进制通信方法，用于高速数据传输
 
