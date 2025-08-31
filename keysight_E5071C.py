@@ -7,11 +7,353 @@ Driver for Keysight K5071C Vector Network Analyzer
 
 import numpy as np
 import pyvisa as visa
-
 from time import sleep
+import time
+from typing import Union, Optional, List, Dict, Tuple, Any, SupportsFloat, Callable, NamedTuple
+import warnings
+from functools import wraps, lru_cache
+from dataclasses import dataclass
+import json
+from pathlib import Path
 
 
-def format_num(arg, units=1, limits=(-float('inf'),float('inf'))) -> str:
+@dataclass
+class TraceData:
+    """
+    迹近数据结构体
+
+    封装迹近的复数数据，并提供常用的计算方法。
+
+    属性:
+        frequency: 频率轴数据 (Hz)
+        real: 实部数据
+        imag: 虚部数据
+        name: 迹近名称
+        s_parameter: S参数类型
+    """
+    frequency: np.ndarray
+    real: np.ndarray
+    imag: np.ndarray
+    name: str = "Trace"
+    s_parameter: str = "S21"
+
+    @property
+    def magnitude(self) -> np.ndarray:
+        """计算幅度（线性）"""
+        return np.sqrt(self.real**2 + self.imag**2)
+
+    @property
+    def magnitude_db(self) -> np.ndarray:
+        """计算幅度（dB）"""
+        return 20 * np.log10(np.abs(self.magnitude))
+
+    @property
+    def phase_deg(self) -> np.ndarray:
+        """计算相位（度）"""
+        return np.arctan2(self.imag, self.real) * 180 / np.pi
+
+    @property
+    def phase_rad(self) -> np.ndarray:
+        """计算相位（弧度）"""
+        return np.arctan2(self.imag, self.real)
+
+    @property
+    def complex_data(self) -> np.ndarray:
+        """返回复数数据"""
+        return self.real + 1j * self.imag
+
+    def get_data_at_frequency(self, target_freq: float, tolerance: float = 1e6) -> Dict[str, float]:
+        """
+        获取指定频率点的数据
+
+        参数:
+            target_freq: 目标频率 (Hz)
+            tolerance: 频率容差 (Hz)
+
+        返回:
+            Dict: 包含幅度、相位等信息的字典
+        """
+        idx = np.argmin(np.abs(self.frequency - target_freq))
+        if np.abs(self.frequency[idx] - target_freq) > tolerance:
+            raise ValueError(f"未找到频率 {target_freq/1e9:.3f}GHz 附近的数据点")
+
+        return {
+            'frequency': self.frequency[idx],
+            'magnitude': self.magnitude[idx],
+            'magnitude_db': self.magnitude_db[idx],
+            'phase_deg': self.phase_deg[idx],
+            'real': self.real[idx],
+            'imag': self.imag[idx]
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式"""
+        return {
+            'name': self.name,
+            's_parameter': self.s_parameter,
+            'frequency': self.frequency,
+            'real': self.real,
+            'imag': self.imag,
+            'magnitude': self.magnitude,
+            'magnitude_db': self.magnitude_db,
+            'phase_deg': self.phase_deg
+        }
+
+
+class MeasurementResult(NamedTuple):
+    """
+    测量结果命名元组
+
+    属性:
+        traces: 所有迹近数据字典
+        frequency: 频率轴数据
+        timestamp: 测量时间戳
+        parameters: 测量参数
+    """
+    traces: Dict[int, TraceData]
+    frequency: np.ndarray
+    timestamp: float
+    parameters: Dict[str, Any]
+
+
+def validate_parameter(param_name: str, valid_options: Optional[List] = None,
+                      param_range: Optional[Tuple[float, float]] = None,
+                      param_type: Optional[type] = None):
+    """
+    参数验证装饰器
+
+    参数:
+        param_name: 参数名称
+        valid_options: 有效选项列表
+        param_range: 数值范围 (min, max)
+        param_type: 预期的参数类型
+
+    使用实例:
+        @validate_parameter('freq', param_range=(1e6, 20e9))
+        def freq_start(self, freq=None, chan=""):
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            # 获取参数值
+            param_value = args[0] if args else kwargs.get(param_name)
+
+            # 如果是查询，跳过验证
+            if param_value is None or param_value == '?':
+                return func(self, *args, **kwargs)
+
+            # 类型验证
+            if param_type and not isinstance(param_value, param_type):
+                try:
+                    param_value = param_type(param_value)
+                except (ValueError, TypeError):
+                    raise TypeError(f"{param_name} 必须是 {param_type.__name__} 类型")
+
+            # 选项验证
+            if valid_options and param_value not in valid_options:
+                raise ValueError(f"{param_name} 必须是以下选项之一: {valid_options}")
+
+            # 范围验证
+            if param_range and isinstance(param_value, (int, float)):
+                if not (param_range[0] <= param_value <= param_range[1]):
+                    raise ValueError(
+                        f"{param_name} 必须在范围 [{param_range[0]}, {param_range[1]}] 内"
+                    )
+
+            return func(self, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+class VNAConstants:
+    """
+    VNA常量配置类
+
+    集中管理所有 Keysight E5071C 相关的配置常量，
+    避免在多个方法中重复定义。
+    """
+
+    # 迹近显示格式
+    TRACE_FORMATS = {
+        'mlog': ' MLOG',
+        'phase': ' PHAS',
+        'lin_mag': ' MLIN',
+        'real': ' REAL',
+        'imag': ' IMAG',
+        'extend_phase': ' UPH',
+        'uph': ' UPH',
+        'positive_phase': ' PPH',
+        'pph': ' PPH',
+        'polar_linear': ' PLIN',
+        'plin': ' PLIN',
+        'polar_log': ' PLOG',
+        'plog': ' PLOG',
+        'real_imag': ' POL',
+        '?': '?'
+    }
+
+    # S参数类型
+    S_PARAMETERS = {
+        's11': ' S11', 's12': ' S12', 's13': ' S13', 's14': ' S14',
+        's21': ' S21', 's22': ' S22', 's23': ' S23', 's24': ' S24',
+        's31': ' S31', 's32': ' S32', 's33': ' S33', 's34': ' S34',
+        's41': ' S41', 's42': ' S42', 's43': ' S43', 's44': ' S44',
+        '?': '?'
+    }
+
+    # 触发源类型
+    TRIGGER_SOURCES = {
+        'internal': ' INT',
+        'external': ' EXT',
+        'manual': ' MAN',
+        'bus': ' BUS',
+        '?': '?'
+    }
+
+    # 触发初始化状态
+    TRIGGER_INITIATE = {
+        'cont': ':CONT ON',
+        'hold': ':CONT OFF',
+        'single': '',
+        '?': '?'
+    }
+
+    # 布尔状态选项
+    BOOL_OPTIONS = {
+        'on': ' ON', '1': ' 1', 'true': ' 1',
+        'off': ' OFF', '0': ' 0', 'false': ' 0',
+        '?': '?'
+    }
+
+    # 扫描类型
+    SWEEP_TYPES = {
+        'linear': ' LIN',
+        'lin': ' LIN',
+        'log': ' LOG',
+        'segmented': ' SEG',
+        'power': ' POW',
+        '?': '?'
+    }
+
+    # 显示通道配置
+    DISPLAY_CHANNELS = {
+        '1': ' D1',
+        '12': ' D1_2',
+        '13': ' D1_3',
+        '123': ' D1_2_3',
+        '1234': ' D1_2_3_4',
+        '123456': ' D1_2_3_4_5_6',
+        '?': '?'
+    }
+
+    # 数据格式
+    DATA_FORMATS = {
+        'ascii': ' ASC',
+        'asc': ' ASC',
+        'real': ' REAL',
+        'real32': ' REAL32',
+        '?': '?'
+    }
+
+    # RF输出状态
+    OUTPUT_STATES = {
+        'true': ' 1', 'on': ' 1', '1': ' 1',
+        'false': ' 0', 'off': ' 0', '0': ' 0',
+        '?': '?'
+    }
+
+
+class ConfigManager:
+    """
+    VNA配置管理器
+
+    负责VNA配置的保存、加载和版本管理。
+    支持JSON格式的配置文件。
+    """
+
+    CONFIG_VERSION = "1.0"
+
+    @staticmethod
+    def save_config(config: Dict[str, Any], filename: str) -> None:
+        """
+        保存配置到文件
+
+        参数:
+            config: 配置字典
+            filename: 文件名
+
+        使用实例:
+            >>> ConfigManager.save_config(vna.get_parameters(), "my_config.json")
+        """
+        config_data = {
+            'version': ConfigManager.CONFIG_VERSION,
+            'timestamp': time.time(),
+            'parameters': config
+        }
+
+        try:
+            with Path(filename).open('w', encoding='utf-8') as f:
+                json.dump(config_data, f, indent=2, ensure_ascii=False, default=str)
+        except Exception as e:
+            raise IOError(f"保存配置文件失败: {e}")
+
+    @staticmethod
+    def load_config(filename: str) -> Dict[str, Any]:
+        """
+        从文件加载配置
+
+        参数:
+            filename: 文件名
+
+        返回:
+            Dict[str, Any]: 配置字典
+
+        使用实例:
+            >>> config = ConfigManager.load_config("my_config.json")
+            >>> vna.set_parameters(**config)
+        """
+        try:
+            with Path(filename).open('r', encoding='utf-8') as f:
+                config_data = json.load(f)
+
+            # 版本检查
+            if config_data.get('version') != ConfigManager.CONFIG_VERSION:
+                warnings.warn(
+                    f"配置文件版本 {config_data.get('version')} 与当前版本 {ConfigManager.CONFIG_VERSION} 不匹配",
+                    UserWarning
+                )
+
+            return config_data.get('parameters', {})
+
+        except FileNotFoundError:
+            raise FileNotFoundError(f"配置文件 {filename} 不存在")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"配置文件格式错误: {e}")
+        except Exception as e:
+            raise IOError(f"加载配置文件失败: {e}")
+
+    @staticmethod
+    def list_configs(directory: str = ".") -> List[str]:
+        """
+        列出目录中的所有配置文件
+
+        参数:
+            directory: 目录路径
+
+        返回:
+            List[str]: 配置文件列表
+        """
+        try:
+            config_files = list(Path(directory).glob("*.json"))
+            return [f.name for f in config_files]
+        except Exception as e:
+            warnings.warn(f"列出配置文件时发生错误: {e}", UserWarning)
+            return []
+
+
+def format_num(arg: Optional[Union[int, float, str, SupportsFloat]],
+               units: Union[int, float] = 1,
+               limits: Tuple[float, float] = (-float('inf'), float('inf'))) -> str:
     """
     格式化数字参数为SCPI命令格式
 
@@ -32,16 +374,34 @@ def format_num(arg, units=1, limits=(-float('inf'),float('inf'))) -> str:
     if arg == None or arg == '?':
         return '?'
     else:
-        # TODO: Make dictionary of units
-        arg = float(arg)*units
-        if arg%1 == 0:
-            arg = int(arg)
-        if limits[0]<=arg<=limits[1]:
-            return ' ' + str(arg)
-        else:
-            raise Exception("OutOfRangeException: Value must be between {} and {}.".format(limits[0], limits[1]))
+    if arg == None or arg == '?':
+        return '?'
 
-def format_from_dict(arg, arg_dict) -> str:
+    try:
+        # 转换为浮点数并应用单位转换
+        numeric_value = float(arg) * units
+
+        # 如果是整数，转换为int避免小数点
+        if numeric_value.is_integer():
+            numeric_value = int(numeric_value)
+
+        # 检查范围限制
+        if not (limits[0] <= numeric_value <= limits[1]):
+            raise OverflowError(
+                f"数值超出范围: {numeric_value}。允许范围: [{limits[0]}, {limits[1]}]"
+            )
+
+        return ' ' + str(numeric_value)
+
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"无法将 '{arg}' 转换为数字: {e}")
+    except OverflowError:
+        raise  # 重新抛出范围错误
+    except Exception as e:
+        raise RuntimeError(f"format_num发生意外错误: {e}")
+
+def format_from_dict(arg: Optional[Union[str, int, float]],
+                     arg_dict: Dict[str, str]) -> str:
     """
     从字典中格式化参数
 
@@ -59,12 +419,19 @@ def format_from_dict(arg, arg_dict) -> str:
     """
     if arg == None:
         arg = '?'
+
+    if arg == '?':
+        return '?'
+
     arg = str(arg).lower()
+
     try:
         return arg_dict[arg]
-    except:
-        print("InvalidInputError: Argument must be : {}".format(list(arg_dict.keys())))
-        return '?' # FIXME: There should be a better way to handle this error with querying the device.
+    except KeyError:
+        valid_keys = list(arg_dict.keys())
+        raise ValueError(f"无效参数 '{arg}'。有效选项: {valid_keys}")
+    except Exception as e:
+        raise RuntimeError(f"format_from_dict发生意外错误: {e}")
 
 class E5071C:
     """
@@ -79,7 +446,8 @@ class E5071C:
         >>> vna.freq_stop(2e9)   # 设置终止频率为2GHz
         >>> data = vna.read_all_traces()  # 读取所有迹近数据
     """
-    def __init__(self, address, configs="", visa_backend=None, verbatim=False):
+    def __init__(self, address: str, configs: str = "",
+                 visa_backend: Optional[str] = None, verbatim: bool = False):
         """
         初始化E5071C实例
 
@@ -100,15 +468,90 @@ class E5071C:
         identity = self.identify()
         print("Identity: {}".format(identity))
         if "E5071C" not in identity:
-            Exception("WARNING: The device:{} is not a E5071C vector network analyzer."
-                      "\nSome commands may not work.".format(address))
+            import warnings
+            warnings.warn(
+                f"警告: 设备 {address} 不是 E5071C 矢量网络分析仪。\n某些命令可能无法工作。",
+                UserWarning
+            )
 
         self.verbatim = verbatim  # Print every command before sending
+        self._is_connected = True
+        self._parameter_cache = {}  # 参数缓存
+        self._cache_timeout = 2.0   # 缓存超时时间(秒)
+        self._last_cache_update = 0
+
+    @lru_cache(maxsize=64)
+    def _get_constant_dict(self, constant_name: str) -> Dict[str, str]:
+        """
+        缓存常量字典获取
+
+        参数:
+            constant_name: 常量名称
+
+        返回:
+            Dict[str, str]: 常量字典
+        """
+        return getattr(VNAConstants, constant_name, {})
+
+    def _is_cache_valid(self) -> bool:
+        """
+        检查缓存是否有效
+
+        返回:
+            bool: 缓存是否有效
+        """
+        import time
+        return (time.time() - self._last_cache_update) < self._cache_timeout
+
+    def _update_cache_timestamp(self) -> None:
+        """更新缓存时间戳"""
+        import time
+        self._last_cache_update = time.time()
+
+    def __enter__(self) -> 'E5071C':
+        """
+        上下文管理器入口
+
+        返回:
+            E5071C: 当前实例
+
+        使用实例:
+            >>> with E5071C("TCPIP::192.168.1.100::INSTR") as vna:
+            ...     vna.freq_start(1e9)
+            ...     data = vna.read_all_traces()
+        """
+        return self
+
+    def __exit__(self, exc_type: Optional[type], exc_val: Optional[Exception],
+                 exc_tb: Optional[Any]) -> bool:
+        """
+        上下文管理器退出
+
+        参数:
+            exc_type: 异常类型
+            exc_val: 异常值
+            exc_tb: 异常跟踪
+
+        返回:
+            bool: False表示不抑制异常
+        """
+        try:
+            self.close()
+        except Exception as e:
+            warnings.warn(f"关闭连接时发生错误: {e}", UserWarning)
+
+        if exc_type is not None:
+            warnings.warn(
+                f"与VNA通信过程中发生异常: {exc_type.__name__}: {exc_val}",
+                UserWarning
+            )
+
+        return False  # 不抑制异常
 
     ########################################
     # Selecting channel and trace
     ########################################
-    def traces_number(self, num=None, chan=""):
+    def traces_number(self, num: Optional[int] = None, chan: str = "") -> Union[int, str]:
         """
         设置或查询迹近数量
 
@@ -129,7 +572,7 @@ class E5071C:
             num = "?"
         return self._com(":CALC{}:PAR:COUN{}".format(chan, num))
 
-    def displayed_channels(self, chans='?'):
+    def displayed_channels(self, chans: str = '?') -> str:
         """
         设置或查询显示的通道
 
@@ -143,18 +586,10 @@ class E5071C:
             >>> vna.displayed_channels('12')  # 显示通道1和2
             >>> vna.displayed_channels()      # 查询当前设置
         """
-        options = {'1': ' D1',
-                   '12': ' D1_2',
-                   '13': ' D1_3',
-                   '123': ' D1_2_3',
-                   '1234': ' D1_2_3_4',
-                   '123456': ' D1_2_3_4_5_6',
-                   '?': '?'
-                   }
-        chans = format_from_dict(chans, options)
+        chans = format_from_dict(chans, VNAConstants.DISPLAY_CHANNELS)
         return self._com(":DISP:SPL{}".format(chans))
 
-    def active_chan(self, chan=None):
+    def active_chan(self, chan: Optional[int] = None) -> Union[int, str]:
         """
         设置或查询活动通道
 
@@ -174,7 +609,7 @@ class E5071C:
         else:
             return self._com(":DISP:WIND{}:ACT".format(chan))
 
-    def active_trace(self, trace=None, chan=""):
+    def active_trace(self, trace: Optional[int] = None, chan: str = "") -> Union[int, str]:
         """
         设置或查询活动迹近
 
@@ -199,7 +634,7 @@ class E5071C:
     # Averaging
     ########################################
 
-    def average_reset(self, chan=""):
+    def average_reset(self, chan: str = "") -> str:
         """
         重置平均统计
 
@@ -214,7 +649,7 @@ class E5071C:
         """
         return self._com(":SENS{}:AVER:CLE".format(chan))
 
-    def average_count(self, count=None, chan=""):
+    def average_count(self, count: Optional[int] = None, chan: str = "") -> Union[int, str]:
         """
         设置或查询平均次数
 
@@ -232,7 +667,7 @@ class E5071C:
         count = format_num(count)
         return self._com(":SENS{}:AVER:COUN{}".format(chan, count))
 
-    def average_state(self, state=None, chan=""):
+    def average_state(self, state: Optional[Union[str, bool, int]] = None, chan: str = "") -> Union[bool, str]:
         """
         设置或查询平均状态
 
@@ -248,18 +683,15 @@ class E5071C:
             >>> vna.average_state('off')  # 关闭平均
             >>> vna.average_state()       # 查询平均状态
         """
-        options = {'on': " on", '1': ' 1', 'true': ' on',
-                   'off': ' off', '0': ' 0', 'false': ' 0',
-                   '?': '?'
-                   }
-        state = format_from_dict(state, options)
+        state = format_from_dict(state, VNAConstants.BOOL_OPTIONS)
         return self._com(":SENS{}:AVER:STAT{}".format(chan, state))
 
     ########################################
     # Frequency axis
     ########################################
     # TODO: Make argument to choose units from a dictionary and make the default GHz
-    def freq_start(self, freq=None, chan=""):
+    @validate_parameter('freq', param_range=(10e3, 20e9))  # 10kHz to 20GHz
+    def freq_start(self, freq: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询起始频率
 
@@ -277,7 +709,8 @@ class E5071C:
         freq = format_num(freq, 1)
         return self._com(":SENS{}:FREQ:STAR{}".format(chan, freq))
 
-    def freq_stop(self, freq=None, chan=""):
+    @validate_parameter('freq', param_range=(10e3, 20e9))
+    def freq_stop(self, freq: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询终止频率
 
@@ -295,7 +728,7 @@ class E5071C:
         freq = format_num(freq, 1)
         return self._com(":SENS{}:FREQ:STOP{}".format(chan, freq))
 
-    def freq_center(self, freq=None, chan=""):
+    def freq_center(self, freq: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询中心频率
 
@@ -313,7 +746,7 @@ class E5071C:
         freq = format_num(freq, 1)
         return self._com(":SENS{}:FREQ:CENT{}".format(chan, freq))
 
-    def freq_span(self, freq=None, chan=""):
+    def freq_span(self, freq: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询频率范围
 
@@ -331,7 +764,8 @@ class E5071C:
         freq = format_num(freq, 1)
         return self._com(":SENS{}:FREQ:SPAN{}".format(chan, freq))
 
-    def points(self, points=None, chan=""):
+    @validate_parameter('points', param_range=(2, 20001), param_type=int)
+    def points(self, points: Optional[int] = None, chan: str = "") -> Union[int, str]:
         """
         设置或查询测量点数
 
@@ -349,7 +783,7 @@ class E5071C:
         points = format_num(points)
         return self._com(":SENS{}:SWE:POIN{}".format(chan, points))
 
-    def ifbw(self, bandwidth=None, chan=""):
+    def ifbw(self, bandwidth: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询中频带宽
 
@@ -367,7 +801,7 @@ class E5071C:
         bandwidth = format_num(bandwidth)
         return self._com(":SENS{}:BAND:RES{}".format(chan, bandwidth))
 
-    def bandwidth(self, bandwidth=None, chan=""):
+    def bandwidth(self, bandwidth: Optional[Union[int, float]] = None, chan: str = "") -> Union[float, str]:
         """
         设置或查询带宽（ifbw的别名）
 
@@ -404,22 +838,7 @@ class E5071C:
             >>> vna.format_trace('phase')    # 设置为相位格式
             >>> vna.format_trace()           # 查询当前格式
         """
-        trace_formats = {'mlog': ' MLOG',
-                         'phase': ' PHAS',
-                         'lin_mag': ' MLIN',
-                         'real': ' REAL',
-                         'imag': " IMAG",
-                         'extend_phase': ' UPH',
-                         'uph': ' UPH',
-                         'positive_phase': ' PPH',
-                         'pph': ' PPH',
-                         'polar_linear': ' PLIN',
-                         'plin': ' PLIN',
-                         'polar_log': ' PLOG',
-                         'plog': ' PLOG',
-                         'real_imag': ' POL',
-                         '?': '?'}
-        trace_format = format_from_dict(trace_format,trace_formats)
+        trace_format = format_from_dict(trace_format, VNAConstants.TRACE_FORMATS)
         return self._com(':CALC{}:SEL:FORM{}'.format(chan, trace_format))
 
     ########################################
@@ -462,7 +881,8 @@ class E5071C:
         phase = format_num(phase)
         return self._com(":CALC{}:CORR:OFFS:PHAS{}".format(chan, phase))
 
-    def power(self, power=None, source=''):
+    @validate_parameter('power', param_range=(-85, 30))  # 典型VNA功率范围
+    def power(self, power: Optional[Union[int, float]] = None, source: str = '') -> Union[float, str]:
         """
         设置或查询输出功率
 
@@ -495,15 +915,7 @@ class E5071C:
             >>> vna.output('off')       # 关闭RF输出
             >>> vna.output()            # 查询RF输出状态
         """
-        options = {'true': ' 1',
-                   'on': ' 1',
-                   '1': ' 1',
-                   'false': ' 0',
-                   'off': ' 0',
-                   '0': ' 0',
-                   '?': '?'
-                   }
-        out = format_from_dict(out, options)
+        out = format_from_dict(out, VNAConstants.OUTPUT_STATES)
         return self._com(":OUTP{}".format(out))
 
     def sweep_type(self, sweep_type=None, chan=""):
@@ -522,14 +934,7 @@ class E5071C:
             >>> vna.sweep_type('log')    # 设置为对数扫描
             >>> vna.sweep_type()         # 查询当前扫描类型
         """
-        sweep_types = {'linear': ' LIN',
-                       'lin': ' LIN',
-                       'log': ' LOG',
-                       'segmented': ' SEG',
-                       'power': ' POW',
-                       '?': '?'
-                       }
-        sweep_type = format_from_dict(sweep_type, sweep_types)
+        sweep_type = format_from_dict(sweep_type, VNAConstants.SWEEP_TYPES)
         return self._com(':SENS{}:SWE:TYPE{}'.format(chan, sweep_type))
 
     def s_par(self, s_par=None, trace="", chan=""):
@@ -549,14 +954,8 @@ class E5071C:
             >>> vna.s_par('S21')       # 设置为S21参数
             >>> vna.s_par()            # 查询当前S参数
         """
-        options = {'s11': ' S11', 's12': ' S12', 's13': ' S13', 's14': ' S14',
-                   's21': ' S21', 's22': ' S22', 's23': ' S23', 's24': ' S24',
-                   's31': ' S31', 's32': ' S32', 's33': ' S33', 's34': ' S34',
-                   's41': ' S41', 's42': ' S42', 's43': ' S43', 's44': ' S44',
-                   '?': '?'
-                   }
-        s_par = format_from_dict(s_par,options)
-        if s_par in options:
+        s_par = format_from_dict(s_par, VNAConstants.S_PARAMETERS)
+        if s_par in VNAConstants.S_PARAMETERS.values():
             return self._com(':CALC{}:PAR{}:DEF{}'.format(chan, trace, s_par))
 
     ########################################
@@ -578,13 +977,7 @@ class E5071C:
             >>> vna.trigger_source('internal') # 设置为内部触发
             >>> vna.trigger_source()           # 查询当前触发源
         """
-        sources = {"internal": " INT",
-                   "external": " EXT",
-                   "manual": " MAN",
-                   "bus": " BUS",
-                   "?": "?"
-                   }
-        source = format_from_dict(source, sources)
+        source = format_from_dict(source, VNAConstants.TRIGGER_SOURCES)
         return self._com(":TRIG:SOUR{}".format(source))
 
 
@@ -604,12 +997,7 @@ class E5071C:
             >>> vna.trigger_initiate('single') # 设置为单次触发
             >>> vna.trigger_initiate('hold')   # 设置为保持状态
         """
-        options = {"cont": ":CONT ON",
-                   "hold": ":CONT OFF",
-                   "single": "",
-                   "?": "?"
-                   }
-        state = format_from_dict(state, options)
+        state = format_from_dict(state, VNAConstants.TRIGGER_INITIATE)
         return self._com('INIT{}{}'.format(chan, state))
 
     def trigger_now(self):
@@ -651,11 +1039,7 @@ class E5071C:
             >>> vna.trigger_averaging('off') # 关闭触发平均
             >>> vna.trigger_averaging()      # 查询当前状态
         """
-        options = {"on": " ON", "1": " 1", "true": " 1",
-                   "off": " OFF", "0": " 0", "false": " 0",
-                   "?": "?"
-                   }
-        averaging = format_from_dict(averaging, options)
+        averaging = format_from_dict(averaging, VNAConstants.BOOL_OPTIONS)
         return self._com(":TRIG:SEQ:AVER{}".format(averaging))
 
     ########################################
@@ -677,16 +1061,10 @@ class E5071C:
             >>> vna.format_data('ascii') # 设置为ASCII格式
             >>> vna.format_data()        # 查询当前数据格式
         """
-        formats = {'ascii': ' ASC',
-                   'asc': ' ASC',
-                   'real': ' REAL',
-                   'real32': ' REAL32',
-                   '?': '?'
-                   }
-        form = format_from_dict(form, formats)
+        form = format_from_dict(form, VNAConstants.DATA_FORMATS)
         return self._com(':FORMat:DATA{}'.format(form))
 
-    def read_freq(self):
+    def read_freq(self) -> np.ndarray:
         """
         读取频率轴数据
 
@@ -704,7 +1082,7 @@ class E5071C:
         self.format_data('ascii')
         return data
 
-    def read_trace(self, trace=None):
+    def read_trace(self, trace: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         读取指定迹近的复数数据
 
@@ -729,7 +1107,7 @@ class E5071C:
 
         return data[0::2], data[1::2]
 
-    def read_all_traces(self):
+    def read_all_traces(self) -> np.ndarray:
         """
         读取当前活动通道的所有迹近数据
 
@@ -765,17 +1143,82 @@ class E5071C:
         self.format_data('ascii')
         return data
 
+    def read_all_traces_structured(self) -> MeasurementResult:
+        """
+        读取所有迹近数据并返回结构化结果
 
-    def close(self):
+        返回:
+            MeasurementResult: 包含结构化迹近数据的结果
+
+        使用实例:
+            >>> result = vna.read_all_traces_structured()
+            >>> trace1 = result.traces[1]
+            >>> print(f"迹近1在2GHz的幅度: {trace1.get_data_at_frequency(2e9)['magnitude_db']:.2f} dB")
+            >>> # 获取所有迹近的幅度数据
+            >>> for trace_id, trace_data in result.traces.items():
+            ...     print(f"迹近{trace_id}: {trace_data.s_parameter}, 最大幅度: {trace_data.magnitude_db.max():.2f} dB")
+        """
+        import time
+
+        # 读取原始数据
+        raw_data = self.read_all_traces()
+        frequency = raw_data[0]
+
+        # 创建结构化迹近数据
+        traces = {}
+        num_traces = (len(raw_data) - 1) // 2
+
+        for i in range(num_traces):
+            trace_id = i + 1
+            real_data = raw_data[2*i + 1]
+            imag_data = raw_data[2*i + 2]
+
+            # 尝试获取当前迹近的S参数信息
+            try:
+                # 设置活动迹近并查询S参数
+                self.active_trace(trace_id)
+                s_param = str(self.s_par()).strip()
+            except:
+                s_param = f"S{trace_id}{trace_id}"  # 默认值
+
+            traces[trace_id] = TraceData(
+                frequency=frequency,
+                real=real_data,
+                imag=imag_data,
+                name=f"Trace{trace_id}",
+                s_parameter=s_param
+            )
+
+        # 获取当前参数
+        try:
+            current_params = self.get_parameters()
+        except:
+            current_params = {}
+
+        return MeasurementResult(
+            traces=traces,
+            frequency=frequency,
+            timestamp=time.time(),
+            parameters=current_params
+        )
+
+
+    def close(self) -> None:
         """
         关闭VISA连接
 
         使用实例:
             >>> vna.close()  # 关闭与仪器的连接
         """
-        self._inst.close()
+        if hasattr(self, '_is_connected') and self._is_connected:
+            try:
+                self._inst.close()
+                self._is_connected = False
+            except Exception as e:
+                warnings.warn(f"关闭VISA连接时发生错误: {e}", UserWarning)
+                raise
 
-    def identify(self):
+    def identify(self) -> str:
         """
         查询仪器身份信息
 
@@ -788,7 +1231,7 @@ class E5071C:
         """
         return self._com("*IDN?")
 
-    def idn(self):
+    def idn(self) -> str:
         """
         查询仪器身份信息（identify的别名）
 
@@ -800,7 +1243,7 @@ class E5071C:
         """
         return self._com("*IDN?")
 
-    def reset(self):
+    def reset(self) -> str:
         """
         重置仪器到默认状态
 
@@ -812,7 +1255,7 @@ class E5071C:
         """
         return self._com('*RST')
 
-    def rst(self):
+    def rst(self) -> str:
         """
         重置仪器到默认状态（reset的别名）
 
@@ -824,7 +1267,7 @@ class E5071C:
         """
         return self._com('*RST')
 
-    def operation_complete(self):
+    def operation_complete(self) -> Union[int, str]:
         """
         查询操作是否完成
 
@@ -837,7 +1280,7 @@ class E5071C:
         """
         return self._com("*OPC?")
 
-    def opc(self):
+    def opc(self) -> Union[int, str]:
         """
         查询操作是否完成（operation_complete的别名）
 
@@ -849,7 +1292,7 @@ class E5071C:
         """
         return self.operation_complete()
 
-    def get_sweep_time(self):
+    def get_sweep_time(self) -> str:
         """
         查询扫描时间
 
@@ -1036,6 +1479,50 @@ class E5071C:
             except KeyError:
                 pass
 
+    def export_config(self, filename: str) -> None:
+        """
+        导出当前配置到文件
+
+        参数:
+            filename: 配置文件名
+
+        使用实例:
+            >>> vna.export_config("my_vna_config.json")
+        """
+        config = self.get_parameters()
+        ConfigManager.save_config(config, filename)
+        print(f"配置已导出到: {filename}")
+
+    def import_config(self, filename: str) -> None:
+        """
+        从文件导入配置
+
+        参数:
+            filename: 配置文件名
+
+        使用实例:
+            >>> vna.import_config("my_vna_config.json")
+        """
+        config = ConfigManager.load_config(filename)
+        self.set_parameters(**config)
+        print(f"配置已从 {filename} 导入")
+
+    def list_config_files(self, directory: str = ".") -> List[str]:
+        """
+        列出可用的配置文件
+
+        参数:
+            directory: 搜索目录
+
+        返回:
+            List[str]: 配置文件列表
+
+        使用实例:
+            >>> configs = vna.list_config_files()
+            >>> print("可用配置:", configs)
+        """
+        return ConfigManager.list_configs(directory)
+
     ##############################
     # send commands
     ##############################
@@ -1219,7 +1706,7 @@ if __name__ == "__main__":
     # Execute measurement and wait for completion
     ################
     print("\n=== 执行测量 ===")
-    print(触发测量结果:", vna.trigger_now())
+    print("触发测量结果:", vna.trigger_now())
 
     ################
     # 读取屏幕上的数据
@@ -1259,7 +1746,7 @@ if __name__ == "__main__":
     print("\n=== 便捷方法示例 ===")
 
     # 一次性设置频率参数
-    vna.set_freq_axis(start=5e9, stop=7e9, point=501, bandwidth=1000)
+    vna.set_freq_axis(start="5e9", stop="7e9", point=501, bandwidth=1000)
     print("已设置频率范围: 5-7 GHz, 501点")
 
     # 一次性设置触发参数
