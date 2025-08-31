@@ -457,12 +457,15 @@ class E5071C:
         使用实例:
             >>> vna = E5071C("TCPIP::192.168.1.100::INSTR", verbatim=True)
         """
-        if visa_backend==None:
-            self._inst = visa.ResourceManager().open_resource(address)
-        else:
-            self._inst = visa.ResourceManager(visa_backend).open_resource(address)
-        # 类型注解，用于解决静态类型检查问题
-        self._inst: Any = self._inst
+        try:
+            if visa_backend==None:
+                self._inst = visa.ResourceManager().open_resource(address)
+            else:
+                self._inst = visa.ResourceManager(visa_backend).open_resource(address)
+            # 类型注解，用于解决静态类型检查问题
+            self._inst: Any = self._inst
+        except Exception as e:
+            raise ConnectionError(f"无法连接到设备 {address}: {e}")
         self.verbatim = verbatim
         identity = self.identify()
         print("Identity: {}".format(identity))
@@ -506,6 +509,19 @@ class E5071C:
         """更新缓存时间戳"""
         import time
         self._last_cache_update = time.time()
+
+    def is_connected(self) -> bool:
+        """
+        检查仪器连接状态
+
+        返回:
+            bool: True表示已连接，False表示已断开
+
+        使用实例:
+            >>> if vna.is_connected():
+            ...     data = vna.read_all_traces()
+        """
+        return hasattr(self, '_is_connected') and self._is_connected
 
     def __enter__(self) -> 'E5071C':
         """
@@ -1179,7 +1195,8 @@ class E5071C:
                 # 设置活动迹近并查询S参数
                 self.active_trace(trace_id)
                 s_param = str(self.s_par()).strip()
-            except:
+            except (ValueError, TypeError, AttributeError) as e:
+                warnings.warn(f"获取迹近{trace_id}的S参数失败: {e}", UserWarning)
                 s_param = f"S{trace_id}{trace_id}"  # 默认值
 
             traces[trace_id] = TraceData(
@@ -1193,7 +1210,8 @@ class E5071C:
         # 获取当前参数
         try:
             current_params = self.get_parameters()
-        except:
+        except (ValueError, TypeError, AttributeError) as e:
+            warnings.warn(f"获取当前参数失败: {e}", UserWarning)
             current_params = {}
 
         return MeasurementResult(
@@ -1435,7 +1453,7 @@ class E5071C:
                       'bandwidth': self.bandwidth(),
                       'format_trace': self.format_trace(),  # get this for each channel
                       's_par': self.s_par(),  # get this for each channel
-                      'power': self.power,
+                      'power': self.power(),
                       'average_count': self.average_count(),
                       'average_state': self.average_state(),
                       'delay': self.delay(),
@@ -1443,7 +1461,7 @@ class E5071C:
                       }
         return parameters
 
-    def set_parameters(self, chan="", **kwargs):
+    def set_parameters(self, chan: str = "", **kwargs) -> None:
         """
         批量设置仪器参数
 
@@ -1473,12 +1491,16 @@ class E5071C:
                       'phase_offset': self.phase_offset
                       }
 
-        # need to figure out how to format the trace specific parameters like format
-        for i in kwargs.keys():
+        # 应用传入的参数设置
+        for param_name, param_value in kwargs.items():
             try:
-                parameters[i](kwargs[i])
-            except KeyError:
-                pass
+                if param_name in parameters:
+                    # 调用对应的设置方法
+                    parameters[param_name](param_value)
+                else:
+                    warnings.warn(f"未知参数: {param_name}", UserWarning)
+            except (ValueError, TypeError, AttributeError) as e:
+                warnings.warn(f"设置参数 {param_name} 失败: {e}", UserWarning)
 
     def export_config(self, filename: str) -> None:
         """
@@ -1546,12 +1568,8 @@ class E5071C:
             value = self._inst.query(cmd)
             try:
                 return float(value)
-            except:
+            except (ValueError, TypeError):
                 return value
-            # try:
-            #     return float(value)
-            # except:
-            #     return value
         else:
             self._inst.write(cmd)
             return "Sent: " + cmd
